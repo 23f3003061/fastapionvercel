@@ -2,25 +2,47 @@
 
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# The JSON file must sit next to this file and be included in the deployment.
+DATA_PATH = Path(__file__).resolve().parent / "q-vercel-latency.json"
 
-DATA_PATH = Path(__file__).with_name("q-vercel-latency.json")
-with DATA_PATH.open(encoding="utf-8") as telemetry_file:
-    TELEMETRY: list[dict[str, Any]] = json.load(telemetry_file)
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE, PATCH",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+}
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+
+@lru_cache(maxsize=1)
+def load_telemetry() -> list[dict[str, Any]]:
+    """Load telemetry lazily so a missing file doesn't crash the function at import time."""
+    with DATA_PATH.open(encoding="utf-8") as telemetry_file:
+        return json.load(telemetry_file)
+
+
+@app.middleware("http")
+async def cors_headers(request: Request, call_next):
+    """Add CORS headers to every response, including preflights and unhandled errors."""
+    if request.method == "OPTIONS":
+        response = Response(status_code=200)
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as exc:  # unhandled errors would otherwise skip the CORS headers
+            print(f"Unhandled error: {exc!r}")  # visible in Vercel function logs
+            response = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    response.headers.update(CORS_HEADERS)
+    return response
 
 
 class LatencyRequest(BaseModel):
@@ -38,11 +60,25 @@ def percentile_95(values: list[float]) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+@app.get("/")
+@app.get("/api/latency")
+@app.get("/api/latency/")
+def root():
+    return {"message": "Regional Latency Telemetry API is live"}
+
+
 @app.post("/api/latency")
+@app.post("/api/latency/")
+@app.post("/latency")
+@app.post("/latency/")
 def latency(request: LatencyRequest) -> dict[str, dict[str, float | int]]:
+    telemetry = load_telemetry()
     result: dict[str, dict[str, float | int]] = {}
     for region in request.regions:
-        records = [row for row in TELEMETRY if row["region"] == region]
+        records = [
+            row for row in telemetry
+            if row.get("region", "").lower() == region.lower()
+        ]
         if not records:
             raise HTTPException(status_code=404, detail=f"No telemetry for region: {region}")
         latencies = [float(row["latency_ms"]) for row in records]
